@@ -4,8 +4,6 @@ def main():
     wrapper = WebArenaWrapper()
     
     # Create specialized agents for web tasks
-
-    #later modify agents needed
     agents = [
         NavigationAgent(model='gpt-4'),
         FormFillerAgent(model='gpt-3.5'),
@@ -29,3 +27,5 @@ def main():
     print(f"Success rate: {results['success_rate']:.2%}")
     print(f"Average cost per task: ${results['avg_cost']:.3f}")
     print(f"Average steps per task: {results['avg_steps']:.1f}")
+    
+    

@@ -1,16 +1,26 @@
 # webarena_wrapper.py
 import time
 from typing import Dict, List, Any
-from webarena.environment import WebArenaEnvironment
-from webarena.evaluation import Evaluator
+# Fix WebArena imports - use actual WebArena structure
+from browser_env import ScriptBrowserEnv
+from evaluation_harness.evaluators import evaluator_router
+
+# Import your monitors
+from monitors.communication_monitor import CommunicationMonitor
+from monitors.action_monitor import ActionMonitor
+from webArenaCostMonitor import WebArenaCostMonitor
 
 class WebArenaWrapper:
     """Wrapper for WebArena that adds cost and communication monitoring"""
     
     def __init__(self, env_config=None):
-        # Initialize WebArena components
-        self.env = WebArenaEnvironment(config=env_config)
-        self.evaluator = Evaluator()
+        # Use actual WebArena environment
+        self.env = ScriptBrowserEnv(
+            headless=True,
+            observation_type="accessibility_tree",
+            current_viewport_only=True,
+            viewport_size={"width": 1280, "height": 720}
+        )
         
         # Initialize monitoring
         self.cost_monitor = WebArenaCostMonitor()

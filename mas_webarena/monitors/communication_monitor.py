@@ -52,4 +52,4 @@ class CommunicationMonitor:
     
     def _count_tokens(self, text: str) -> int:
         """Approximate token count"""
-        return len(text.split()) * 1.3  # Rough approximation
+        return len(text.split()) * 1.3  # Rough approximation ask others for opionion 

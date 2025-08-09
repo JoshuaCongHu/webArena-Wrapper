@@ -1,4 +1,4 @@
-from utils.llm_utils import count_tokens
+
 
 class WebNavigationAgent:
     """Agent specialized for web navigation"""
@@ -16,7 +16,8 @@ class WebNavigationAgent:
         response = self.llm.generate(prompt)
         action = self.parse_action(response)
         
-        # Track cost
+        # Track cost i swear i saw the count tokens function search docs
+        
         self.cost_tracker.track_llm_call(
             model=self.model_name,
             tokens_in=count_tokens(prompt),

@@ -3,6 +3,7 @@ import numpy as np
 import networkx as nx
 from typing import Dict, Any, List, Optional, Tuple
 import json
+import time
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -10,13 +11,29 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from algorithms.ppo_lagrangian import PPOLagrangian
 from algorithms.p3o import P3O
 from algorithms.macpo import MACPO
-from models.orchestrator import OrchestratorPolicy
+# Legacy neural orchestrator (deprecated in favor of LLM orchestrator)
+# from models.orchestrator import OrchestratorPolicy
+from orchestrator import (
+    LLMOrchestratorPolicy, 
+    DAGCacheManager, 
+    ReplanningEngine,
+    build_context,
+    update_context_with_result
+)
+from utils.budget_tracker import BudgetTracker
+
+# Import WebArenaMetrics for enhanced tracking
+try:
+    from WebArenaMetrics import WebArenaMetrics
+    HAS_WEBARENA_METRICS = True
+except ImportError:
+    HAS_WEBARENA_METRICS = False
+    print("Warning: WebArenaMetrics not found, using basic metrics")
 
 # Import existing WebArena components if available
 try:
     # Try to import from existing WebArena MAS implementation
     from run_webarena_experiment import WebArenaMAS, Agent
-    from WebArenaSpecificMetrics import WebArenaMetrics
     HAS_WEBARENA = True
 except ImportError:
     HAS_WEBARENA = False
@@ -42,22 +59,23 @@ class EnhancedWebArenaMAS:
     """Research-grade MAS with multiple constraint methods"""
     
     def __init__(self, 
-                 method: str = 'ppo_lagrangian',  # or 'p3o' or 'macpo'
+                 method: str = 'p3o',  # 'ppo_lagrangian', 'p3o', or 'macpo'
                  budget: float = 1.0,
                  num_agents: int = 4,
                  state_dim: int = 128,
                  action_dim: int = 64,
                  max_nodes: int = 10,
                  device: str = 'cpu',
-                 use_orchestrator: bool = True,
-                 parallel_execution: bool = True):
+                 use_llm_orchestrator: bool = True,  # Primary orchestration mode
+                 llm_model: str = "gpt-4-turbo",
+                 enable_replanning: bool = True):
         
         self.method = method
         self.budget = budget
         self.num_agents = num_agents
         self.device = torch.device(device)
-        self.use_orchestrator = use_orchestrator
-        self.parallel_execution = parallel_execution
+        self.use_llm_orchestrator = use_llm_orchestrator
+        self.enable_replanning = enable_replanning
         
         # Initialize algorithm
         if method == 'ppo_lagrangian':
@@ -82,15 +100,50 @@ class EnhancedWebArenaMAS:
         else:
             raise ValueError(f"Unknown method: {method}")
         
-        # Orchestrator for hierarchical control
-        if self.use_orchestrator:
-            self.orchestrator = OrchestratorPolicy(
-                obs_dim=state_dim,
+        # Neural orchestrator (deprecated - use LLM orchestrator instead)
+        self.orchestrator = None
+        
+        # LLM-based orchestrator components
+        if self.use_llm_orchestrator:
+            self.llm_orchestrator = LLMOrchestratorPolicy(
+                llm_model=llm_model,
+                method=method,
+                budget=budget,
                 max_nodes=max_nodes,
-                num_agents=num_agents
-            ).to(self.device)
+                num_agents=num_agents,
+                state_dim=state_dim,
+                action_dim=action_dim,
+                device=device
+            )
+            
+            # Cache manager for successful DAGs
+            self.cache_manager = DAGCacheManager(
+                cache_dir=f"dag_cache_{method}",
+                max_cache_size=1000
+            )
+            
+            # Replanning engine
+            if self.enable_replanning:
+                self.replanning_engine = ReplanningEngine(
+                    orchestrator=self.llm_orchestrator,
+                    replan_threshold=0.3,
+                    max_replans_per_task=3
+                )
+            else:
+                self.replanning_engine = None
         else:
-            self.orchestrator = None
+            self.llm_orchestrator = None
+            self.cache_manager = None
+            self.replanning_engine = None
+        
+        # Budget tracker
+        self.budget_tracker = BudgetTracker(initial_budget=budget)
+        
+        # Enhanced metrics tracking
+        if HAS_WEBARENA_METRICS:
+            self.webarena_metrics = WebArenaMetrics()
+        else:
+            self.webarena_metrics = None
         
         # Agent pool (use existing if available, otherwise mock)
         self.agent_pool = self._initialize_agent_pool()
@@ -124,238 +177,394 @@ class EnhancedWebArenaMAS:
             # Use mock agents
             return [MockAgent(f"agent_{i}") for i in range(self.num_agents)]
     
-    def solve_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Solve WebArena task with cost guarantees"""
+    def _json_dag_to_networkx(self, dag_json: Dict) -> nx.DiGraph:
+        """Convert JSON DAG format to NetworkX DiGraph"""
+        G = nx.DiGraph()
         
-        self.episode_count += 1
+        # Add nodes
+        for node in dag_json.get('nodes', []):
+            node_id = node['id']
+            G.add_node(node_id, **node)
         
-        # Encode task state
-        state = self._encode_state(task)
-        state_tensor = torch.FloatTensor(state['obs']).unsqueeze(0).to(self.device)
+        # Add edges
+        for edge in dag_json.get('edges', []):
+            if len(edge) == 2:
+                G.add_edge(edge[0], edge[1])
         
-        # Generate DAG decomposition if using orchestrator
-        if self.use_orchestrator:
-            with torch.no_grad():
-                graph_state = torch.FloatTensor(state.get('graph', np.zeros((5, 128)))).unsqueeze(0).to(self.device)
-                adj_matrix, agent_assignments, node_difficulties = self.orchestrator(state_tensor, graph_state)
-            
-            # Build DAG from adjacency matrix
-            dag = self.orchestrator.sample_dag(adj_matrix.squeeze(0))
-            agent_assign = agent_assignments.squeeze(0).cpu().numpy()
-            difficulties = node_difficulties.squeeze(0).cpu().numpy()
+        return G
+    
+    def _find_executable_nodes(self, dag: nx.DiGraph, executed: set) -> List[int]:
+        """Find nodes that can be executed (dependencies satisfied)"""
+        executable = []
+        
+        for node_id in dag.nodes():
+            if node_id in executed:
+                continue
+                
+            # Check if all dependencies are satisfied
+            dependencies_met = True
+            for pred in dag.predecessors(node_id):
+                if pred not in executed:
+                    dependencies_met = False
+                    break
+                    
+            if dependencies_met:
+                executable.append(node_id)
+                
+        return executable
+    
+    def _execute_node(self, node_id: int, dag: Dict, task: Dict, context: Dict) -> Dict:
+        """Execute a single node"""
+        # Get node info
+        if isinstance(dag, dict) and 'nodes' in dag:
+            # JSON DAG format
+            node_info = None
+            for node in dag['nodes']:
+                if node['id'] == node_id:
+                    node_info = node
+                    break
+            if not node_info:
+                node_info = {'id': node_id, 'task': f'action_{node_id}', 'estimated_cost': 0.05}
         else:
-            # Use simple sequential decomposition
-            dag = self._create_simple_dag(task)
-            agent_assign = np.ones((len(dag.nodes()), self.num_agents)) / self.num_agents
-            difficulties = np.ones(len(dag.nodes())) * 0.5
+            # NetworkX format
+            node_info = dag.nodes[node_id] if node_id in dag.nodes else {'id': node_id, 'task': f'action_{node_id}'}
         
-        # Execute DAG with assigned agents
-        trajectory = self._execute_dag(dag, agent_assign, difficulties, task, state_tensor)
-        
-        # Calculate metrics
-        success = self._evaluate_success(trajectory, task)
-        total_cost = sum(t['cost'] for t in trajectory)
-        total_reward = sum(t['reward'] for t in trajectory)
-        
-        # Update policy based on method
-        if self.method == 'macpo':
-            # Group trajectory by agent for MACPO
-            trajectories_by_agent = self._group_trajectory_by_agent(trajectory)
-            update_info = self.algorithm.update(trajectories_by_agent)
+        # Get assigned agent (from JSON DAG)
+        if isinstance(dag, dict) and 'agent_assignments' in dag:
+            agent_name = dag['agent_assignments'].get(str(node_id), 'gpt-4-turbo')
+            # Map agent name to index (simplified)
+            agent_mapping = {'claude-3.5': 0, 'gpt-4-turbo': 1, 'kimi-k2': 2, 'gemini-1.5': 3}
+            agent_id = agent_mapping.get(agent_name, 0) % len(self.agent_pool)
         else:
-            # Single trajectory for PPO-Lagrangian and P3O
-            update_info = self.algorithm.update(trajectory)
+            agent_id = np.random.choice(len(self.agent_pool))
         
-        # Track metrics
-        self._update_metrics(success, total_cost, total_reward, dag, update_info, trajectory)
+        # Execute action (mock for now - would call actual WebArena agent)
+        success = np.random.random() > 0.2  # 80% success rate
         
         result = {
+            'node_id': node_id,
+            'action': node_info.get('task', f'action_{node_id}'),
+            'agent_id': agent_id,
+            'cost': node_info.get('estimated_cost', 0.05),
+            'reward': node_info.get('expected_reward', 0.1) if success else 0,
             'success': success,
-            'cost': total_cost,
-            'reward': total_reward,
-            'trajectory': trajectory,
-            'dag': dag,
-            'method_info': update_info,
-            'episode': self.episode_count,
-            'dag_metrics': self.orchestrator.compute_dag_metrics(dag) if self.use_orchestrator else {}
+            'observation': f"Executed {node_info.get('task', f'action_{node_id}')}",
+            'timestamp': time.time()
         }
         
         return result
     
-    def _encode_state(self, task: Dict[str, Any]) -> Dict[str, np.ndarray]:
-        """Encode task into state representation"""
-        # Mock state encoding - in practice this would use actual WebArena state
-        obs_dim = 128
+    def _is_task_complete(self, trajectory: List[Dict], task: Dict) -> bool:
+        """Check if task is complete"""
+        if not trajectory:
+            return False
         
-        # Create observation from task
-        task_text = task.get('intent', '') + ' ' + str(task.get('sites', []))
+        # Simple completion check based on success rate and trajectory length
+        expected_steps = task.get('expected_steps', 5)
+        if len(trajectory) >= expected_steps:
+            success_count = sum(1 for t in trajectory if t.get('success', False))
+            return success_count >= expected_steps * 0.6  # 60% success rate threshold
         
-        # Simple text encoding (hash-based for reproducibility)
-        hash_val = hash(task_text)
-        obs = np.random.RandomState(hash_val % 2**31).random(obs_dim).astype(np.float32)
+        return False
+    
+    def _calculate_reward(self, trajectory: List[Dict], success: bool, total_cost: float) -> float:
+        """Calculate final reward based on trajectory"""
+        if not trajectory:
+            return 0.0
         
-        # Graph state (representing current DOM structure or site state)
-        graph_state = np.random.RandomState((hash_val + 1) % 2**31).random((5, 128)).astype(np.float32)
+        # Base reward from trajectory
+        trajectory_reward = sum(t.get('reward', 0) for t in trajectory)
         
-        return {
-            'obs': obs,
-            'graph': graph_state,
-            'task_id': task.get('task_id', 'unknown')
+        # Success bonus
+        success_bonus = 1.0 if success else 0.0
+        
+        # Cost penalty (encourage efficient solutions)
+        cost_penalty = max(0, total_cost - self.budget) * 2.0
+        
+        return trajectory_reward + success_bonus - cost_penalty
+    
+    def _prepare_trajectory_for_rl(self, trajectory: List[Dict], context: Dict, dag: Dict, logits: torch.Tensor) -> List[Dict]:
+        """Prepare trajectory for RL update with LLM integration"""
+        rl_trajectory = []
+        
+        for step in trajectory:
+            # Convert to RL format
+            rl_step = {
+                'state': step.get('state', np.zeros(128)),
+                'action': step.get('action', 0),
+                'reward': step.get('reward', 0),
+                'cost': step.get('cost', 0),
+                'done': step.get('done', False),
+                'log_prob': step.get('log_prob', 0),
+                'success': step.get('success', False)
+            }
+            
+            # Add LLM-specific information
+            if 'node_id' in step:
+                rl_step['node_id'] = step['node_id']
+            if 'agent_id' in step:
+                rl_step['agent_id'] = step['agent_id']
+            
+            rl_trajectory.append(rl_step)
+        
+        return rl_trajectory
+    
+    def _compute_dag_metrics(self, dag: nx.DiGraph) -> Dict:
+        """Compute DAG metrics"""
+        if len(dag.nodes()) == 0:
+            return {'nodes': 0, 'edges': 0, 'diameter': 0, 'avg_degree': 0}
+        
+        metrics = {
+            'nodes': dag.number_of_nodes(),
+            'edges': dag.number_of_edges(),
+            'avg_degree': np.mean([d for n, d in dag.degree()]) if dag.degree() else 0
         }
+        
+        if nx.is_weakly_connected(dag):
+            metrics['diameter'] = nx.diameter(dag.to_undirected())
+        else:
+            metrics['diameter'] = -1  # Disconnected
+            
+        return metrics
+    
+    def solve_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Complete implementation with LLM orchestrator
+        """
+        self.episode_count += 1
+        
+        # Initialize components
+        trajectory = []
+        total_cost = 0
+        total_reward = 0
+        replanning_count = 0
+        
+        # Reset budget tracker for this task
+        self.budget_tracker.reset()
+        
+        # Build initial context and generate DAG
+        if self.use_llm_orchestrator:
+            # LLM-based orchestration (primary mode)
+            context = build_context(
+                task=task,
+                current_observation=task.get('observation', ''),
+                trajectory=[],
+                budget_tracker=self.budget_tracker,
+                episode=self.episode_count,
+                method=self.method
+            )
+            
+            # Generate initial DAG using LLM
+            dag_gen_start = time.time()
+            dag_json, logits = self.llm_orchestrator.generate_dag(
+                context=context,
+                use_cache=True,
+                cache_manager=self.cache_manager
+            )
+            dag_gen_time = time.time() - dag_gen_start
+            
+            # Track DAG generation metrics
+            if self.webarena_metrics:
+                self.webarena_metrics.track_dag_generation(
+                    dag_id=f"dag_{self.episode_count}_0",
+                    generation_method="llm",
+                    llm_model=self.llm_orchestrator.llm_model,
+                    node_count=len(dag_json['dag'].get('nodes', [])),
+                    edge_count=len(dag_json['dag'].get('edges', [])),
+                    confidence_score=dag_json.get('confidence', 0.5),
+                    generation_time=dag_gen_time,
+                    generation_cost=0.01,  # Estimated cost - could be tracked by LLM orchestrator
+                    validation_passed=True,  # Assume validation passed if no exception
+                    cache_hit=False  # Could be tracked by cache manager
+                )
+            
+            # Convert JSON DAG to NetworkX format for execution
+            current_dag = dag_json
+            dag = self._json_dag_to_networkx(dag_json['dag'])
+            
+        else:
+            # Fallback mode: simple sequential decomposition
+            dag = self._create_simple_dag(task)
+            current_dag = {'dag': {'nodes': [{'id': i, 'task': f'step_{i}'} for i in dag.nodes()], 'confidence': 0.6}}
+            logits = torch.zeros(1, 256)
+            context = {}
+        
+        # Main execution loop
+        executed_nodes = set()
+        max_iterations = 30  # Prevent infinite loops
+        
+        for iteration in range(max_iterations):
+            # Check if task is complete
+            if self._is_task_complete(trajectory, task):
+                break
+                
+            # Execute next batch of nodes
+            executable_nodes = self._find_executable_nodes(dag, executed_nodes)
+            
+            if not executable_nodes:
+                break  # No more nodes to execute
+                
+            # Execute nodes (possibly in parallel)
+            batch_results = []
+            for node_id in executable_nodes:
+                exec_start = time.time()
+                result = self._execute_node(
+                    node_id=node_id,
+                    dag=current_dag['dag'] if self.use_llm_orchestrator else dag,
+                    task=task,
+                    context=context if self.use_llm_orchestrator else {}
+                )
+                exec_time = time.time() - exec_start
+                
+                # Track action execution with enhanced metrics
+                if self.webarena_metrics:
+                    self.webarena_metrics.track_action(
+                        agent_id=result.get('agent_id', f'agent_{node_id % self.num_agents}'),
+                        action_type=result.get('action_type', 'web_action'),
+                        success=result.get('success', False),
+                        execution_time=exec_time,
+                        cost=result.get('cost', 0.0),
+                        error_message=result.get('error_message'),
+                        node_id=node_id,
+                        dag_confidence=current_dag.get('confidence', 0.5) if self.use_llm_orchestrator else None,
+                        replanned=result.get('replanned', False),
+                        llm_tokens_used=result.get('llm_tokens_used')
+                    )
+                
+                batch_results.append(result)
+                executed_nodes.add(node_id)
+                
+            # Update trajectory and costs
+            trajectory.extend(batch_results)
+            batch_cost = sum(r['cost'] for r in batch_results)
+            total_cost += batch_cost
+            
+            # Update budget tracker
+            if not self.budget_tracker.consume(batch_cost):
+                break  # Budget exhausted
+                
+            # Check for re-planning (LLM orchestrator only)
+            if self.use_llm_orchestrator and self.enable_replanning and self.replanning_engine:
+                # Update context with latest state
+                if batch_results:
+                    context = update_context_with_result(context, batch_results[-1])
+                
+                should_replan, reason = self.replanning_engine.should_replan(
+                    current_state=context,
+                    trajectory=trajectory,
+                    current_dag=current_dag
+                )
+                
+                if should_replan:
+                    replan_start = time.time()
+                    new_dag_id = f"dag_{self.episode_count}_{replanning_count + 1}"
+                    current_dag = self.replanning_engine.execute_replanning(
+                        current_dag=current_dag,
+                        current_state=context,
+                        reason=reason,
+                        completed_nodes=list(executed_nodes)
+                    )
+                    replan_time = time.time() - replan_start
+                    
+                    # Track replanning metrics
+                    if self.webarena_metrics:
+                        self.webarena_metrics.track_replanning(
+                            original_dag_id=f"dag_{self.episode_count}_{replanning_count}",
+                            new_dag_id=new_dag_id,
+                            trigger_reason=reason,
+                            completed_nodes=list(executed_nodes),
+                            remaining_budget=self.budget_tracker.remaining_budget,
+                            replan_generation_time=replan_time,
+                            replan_cost=0.005  # Estimated replanning cost
+                        )
+                    
+                    # Update NetworkX DAG
+                    dag = self._json_dag_to_networkx(current_dag['dag'])
+                    replanning_count += 1
+                    
+                    # Mark in trajectory
+                    if trajectory:
+                        trajectory[-1]['replanned'] = True
+                        trajectory[-1]['replan_reason'] = reason
+        
+        # Calculate final metrics
+        success = self._evaluate_success(trajectory, task)
+        final_reward = self._calculate_reward(trajectory, success, total_cost)
+        total_reward = final_reward
+        
+        # Prepare trajectory for RL update
+        if self.use_llm_orchestrator:
+            rl_trajectory = self._prepare_trajectory_for_rl(
+                trajectory, context, current_dag, logits
+            )
+        else:
+            rl_trajectory = trajectory
+        
+        # Update policy
+        if self.method == 'macpo':
+            trajectories_by_agent = self._group_trajectory_by_agent(rl_trajectory)
+            update_info = self.algorithm.update(trajectories_by_agent)
+        else:
+            update_info = self.algorithm.update(rl_trajectory)
+        
+        # Cache successful DAG (LLM orchestrator only)
+        if success and self.use_llm_orchestrator and self.cache_manager:
+            self.cache_manager.cache_successful_dag(
+                context=context,
+                dag=current_dag,
+                metrics={'success': success, 'cost': total_cost, 'reward': final_reward}
+            )
+        
+        # Update metrics
+        self._update_metrics(
+            success=success,
+            cost=total_cost,
+            reward=final_reward,
+            dag=dag,
+            update_info=update_info,
+            trajectory=trajectory,
+            replanning_count=replanning_count
+        )
+        
+        result = {
+            'success': success,
+            'cost': total_cost,
+            'reward': final_reward,
+            'trajectory': trajectory,
+            'dag': current_dag if self.use_llm_orchestrator else dag,
+            'method_info': update_info,
+            'episode': self.episode_count,
+            'replanning_count': replanning_count,
+            'dag_metrics': self._compute_dag_metrics(dag)
+        }
+        
+        if self.use_llm_orchestrator:
+            result['logits'] = logits
+        
+        # Add enhanced metrics summary if available
+        if self.webarena_metrics:
+            result['enhanced_metrics'] = {
+                'task_summary': self.webarena_metrics.get_task_summary(),
+                'llm_orchestrator_metrics': self.webarena_metrics.get_llm_orchestrator_metrics(),
+                'cost_analysis': self.webarena_metrics.get_cost_analysis()
+            }
+        
+        return result
     
     def _create_simple_dag(self, task: Dict[str, Any]) -> nx.DiGraph:
-        """Create a simple sequential DAG for non-orchestrator mode"""
+        """Create a simple sequential DAG for fallback mode"""
         G = nx.DiGraph()
         
         # Simple 3-step process: navigate -> interact -> verify
         steps = ['navigate', 'interact', 'verify']
         
         for i, step in enumerate(steps):
-            G.add_node(i, action=step)
+            G.add_node(i, action=step, task=step)
             if i > 0:
                 G.add_edge(i-1, i)
         
         return G
     
-    def _execute_dag(self, dag: nx.DiGraph, 
-                    agent_assignments: np.ndarray,
-                    node_difficulties: np.ndarray,
-                    task: Dict, 
-                    state_tensor: torch.Tensor) -> List[Dict]:
-        """Execute DAG with parallel/sequential scheduling"""
-        
-        trajectory = []
-        
-        if len(dag.nodes()) == 0:
-            # Empty DAG, return empty trajectory
-            return trajectory
-        
-        # Topological sort for execution order
-        try:
-            exec_order = list(nx.topological_sort(dag))
-        except nx.NetworkXError:
-            # If not a DAG, use node order
-            exec_order = list(dag.nodes())
-        
-        # Group by levels for parallel execution
-        if self.parallel_execution and len(exec_order) > 1:
-            levels = self._compute_dag_levels(dag)
-        else:
-            levels = [[node] for node in exec_order]
-        
-        current_state = state_tensor
-        total_cost = 0
-        
-        for level_idx, level_nodes in enumerate(levels):
-            if self._should_parallelize(level_nodes) and self.parallel_execution:
-                # Execute in parallel
-                results = self._execute_parallel(level_nodes, agent_assignments, node_difficulties, task, current_state)
-            else:
-                # Execute sequentially
-                results = self._execute_sequential(level_nodes, agent_assignments, node_difficulties, task, current_state)
-            
-            # Add results to trajectory
-            for result in results:
-                # Add state information to trajectory
-                result['state'] = current_state.squeeze(0).cpu().numpy()
-                result['level'] = level_idx
-                trajectory.append(result)
-                total_cost += result['cost']
-            
-            # Check budget constraint
-            if total_cost > self.budget * 1.05:  # Hard stop at 105% budget (matches CLAUDE.md)
-                break
-        
-        return trajectory
-    
-    def _compute_dag_levels(self, dag: nx.DiGraph) -> List[List[int]]:
-        """Compute levels of DAG for parallel execution"""
-        levels = []
-        remaining_nodes = set(dag.nodes())
-        
-        while remaining_nodes:
-            # Find nodes with no incoming edges from remaining nodes
-            current_level = []
-            for node in remaining_nodes:
-                predecessors = set(dag.predecessors(node)) & remaining_nodes
-                if not predecessors:
-                    current_level.append(node)
-            
-            if not current_level:
-                # Circular dependency, break it
-                current_level = [remaining_nodes.pop()]
-            
-            levels.append(current_level)
-            remaining_nodes -= set(current_level)
-        
-        return levels
-    
-    def _should_parallelize(self, level_nodes: List[int]) -> bool:
-        """Decide whether to parallelize execution of level nodes"""
-        return len(level_nodes) > 1 and len(level_nodes) <= self.num_agents
-    
-    def _execute_parallel(self, level_nodes: List[int], 
-                         agent_assignments: np.ndarray,
-                         node_difficulties: np.ndarray,
-                         task: Dict, 
-                         state: torch.Tensor) -> List[Dict]:
-        """Execute nodes in parallel"""
-        results = []
-        
-        for node_id in level_nodes:
-            # Choose agent based on assignment probabilities
-            if node_id < len(agent_assignments):
-                agent_probs = agent_assignments[node_id]
-                agent_id = np.random.choice(self.num_agents, p=agent_probs)
-            else:
-                agent_id = np.random.choice(self.num_agents)
-            
-            # Get agent action based on method
-            action, log_prob = self._get_agent_action(agent_id, state, node_id)
-            
-            # Execute action with assigned agent
-            agent = self.agent_pool[agent_id]
-            execution_result = agent.execute_action({'action': action.item(), 'node_id': node_id})
-            
-            # Compute cost based on difficulty and method
-            base_cost = np.random.uniform(0.01, 0.1)
-            if node_id < len(node_difficulties):
-                difficulty_multiplier = 1 + node_difficulties[node_id]
-            else:
-                difficulty_multiplier = 1.5
-            
-            cost = base_cost * difficulty_multiplier
-            
-            results.append({
-                'action': action.item(),
-                'agent_id': agent_id,
-                'node_id': node_id,
-                'cost': cost,
-                'reward': execution_result['reward'],
-                'success': execution_result['success'],
-                'log_prob': log_prob.item(),
-                'done': False
-            })
-        
-        return results
-    
-    def _execute_sequential(self, level_nodes: List[int], 
-                           agent_assignments: np.ndarray,
-                           node_difficulties: np.ndarray,
-                           task: Dict, 
-                           state: torch.Tensor) -> List[Dict]:
-        """Execute nodes sequentially"""
-        # For sequential execution, we can reuse the parallel logic
-        # but execute one at a time
-        return self._execute_parallel(level_nodes, agent_assignments, node_difficulties, task, state)
-    
-    def _get_agent_action(self, agent_id: int, state: torch.Tensor, node_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get action from agent based on method"""
-        if self.method == 'macpo':
-            return self.algorithm.get_action(agent_id, state.squeeze(0))
-        else:
-            # For PPO-Lagrangian and P3O, use single policy
-            return self.algorithm.get_action(state.squeeze(0))
     
     def _group_trajectory_by_agent(self, trajectory: List[Dict]) -> List[List[Dict]]:
         """Group trajectory by agent for MACPO"""
@@ -379,7 +588,8 @@ class EnhancedWebArenaMAS:
         return success_rate >= 0.8
     
     def _update_metrics(self, success: bool, cost: float, reward: float,
-                       dag: nx.DiGraph, update_info: Dict, trajectory: List[Dict]):
+                       dag: nx.DiGraph, update_info: Dict, trajectory: List[Dict],
+                       replanning_count: int = 0):
         """Update research metrics"""
         
         self.metrics['success_rate'].append(success)
@@ -389,9 +599,14 @@ class EnhancedWebArenaMAS:
         self.metrics['episode_lengths'].append(len(trajectory))
         self.metrics['constraint_violations'].append(max(0, cost - self.budget * 1.05))
         
+        # Add replanning metrics
+        if 'replanning_count' not in self.metrics:
+            self.metrics['replanning_count'] = []
+        self.metrics['replanning_count'].append(replanning_count)
+        
         # DAG metrics
-        if self.use_orchestrator:
-            dag_metrics = self.orchestrator.compute_dag_metrics(dag)
+        if self.use_llm_orchestrator:
+            dag_metrics = self._compute_dag_metrics(dag)
             self.metrics['dag_complexity'].append(dag_metrics)
         
         # Method-specific metrics
@@ -403,28 +618,49 @@ class EnhancedWebArenaMAS:
         if not self.metrics['success_rate']:
             return {}
         
-        recent_slice = slice(-window, None) if len(self.metrics['success_rate']) > window else slice(None)
+        # Get recent metrics within window
+        recent_success = self.metrics['success_rate'][-window:]
+        recent_cost = self.metrics['avg_cost'][-window:]
+        recent_reward = self.metrics['avg_reward'][-window:]
+        recent_violations = self.metrics['constraint_violations'][-window:]
         
         summary = {
-            'success_rate': np.mean(self.metrics['success_rate'][recent_slice]),
-            'cost_guarantee_rate': np.mean(self.metrics['cost_guarantee_rate'][recent_slice]),
-            'avg_cost': np.mean(self.metrics['avg_cost'][recent_slice]),
-            'avg_reward': np.mean(self.metrics['avg_reward'][recent_slice]),
-            'avg_episode_length': np.mean(self.metrics['episode_lengths'][recent_slice]),
-            'constraint_violation_rate': np.mean([v > 0 for v in self.metrics['constraint_violations'][recent_slice]]),
-            'episodes': len(self.metrics['success_rate'])
+            'success_rate': np.mean(recent_success),
+            'cost_guarantee_rate': np.mean(self.metrics['cost_guarantee_rate'][-window:]),
+            'avg_cost': np.mean(recent_cost),
+            'avg_reward': np.mean(recent_reward),
+            'constraint_violation_rate': np.mean([v > 0 for v in recent_violations]),
+            'avg_episode_length': np.mean(self.metrics['episode_lengths'][-window:]),
+            'total_episodes': len(self.metrics['success_rate'])
         }
         
         # Add method-specific metrics
         if self.method == 'ppo_lagrangian' and self.metrics['duality_gap']:
-            summary['avg_duality_gap'] = np.mean(self.metrics['duality_gap'][recent_slice])
+            summary['avg_duality_gap'] = np.mean(self.metrics['duality_gap'][-window:])
         
-        # Add DAG metrics if available
-        if self.metrics['dag_complexity'] and self.metrics['dag_complexity'][0]:
-            dag_metrics = self.metrics['dag_complexity'][recent_slice]
-            if dag_metrics:
-                summary['avg_dag_nodes'] = np.mean([d['nodes'] for d in dag_metrics])
-                summary['avg_dag_edges'] = np.mean([d['edges'] for d in dag_metrics])
+        # Add LLM orchestrator specific metrics
+        if self.use_llm_orchestrator and 'replanning_count' in self.metrics:
+            summary['avg_replanning_count'] = np.mean(self.metrics['replanning_count'][-window:])
+            summary['replanning_rate'] = np.mean([r > 0 for r in self.metrics['replanning_count'][-window:]])
+        
+        return summary
+    
+    def get_enhanced_metrics_summary(self) -> Dict[str, Any]:
+        """Get comprehensive metrics including WebArenaMetrics if available"""
+        summary = {
+            'basic_metrics': self.get_metrics_summary(),
+            'method': self.method,
+            'use_llm_orchestrator': self.use_llm_orchestrator,
+            'total_episodes': self.episode_count
+        }
+        
+        if self.webarena_metrics:
+            summary['enhanced_metrics'] = {
+                'task_summary': self.webarena_metrics.get_task_summary(),
+                'llm_orchestrator_metrics': self.webarena_metrics.get_llm_orchestrator_metrics(),
+                'cost_analysis': self.webarena_metrics.get_cost_analysis(),
+                'efficiency_metrics': self.webarena_metrics.get_efficiency_metrics()
+            }
         
         return summary
     
@@ -435,7 +671,7 @@ class EnhancedWebArenaMAS:
             'episode_count': self.episode_count,
             'metrics': self.metrics,
             'algorithm_state': None,
-            'orchestrator_state': None
+            'use_llm_orchestrator': self.use_llm_orchestrator
         }
         
         # Save algorithm state
@@ -443,10 +679,6 @@ class EnhancedWebArenaMAS:
             algorithm_path = filepath.replace('.pt', '_algorithm.pt')
             self.algorithm.save_checkpoint(algorithm_path)
             checkpoint['algorithm_path'] = algorithm_path
-        
-        # Save orchestrator state
-        if self.use_orchestrator:
-            checkpoint['orchestrator_state'] = self.orchestrator.state_dict()
         
         torch.save(checkpoint, filepath)
         print(f"Checkpoint saved to {filepath}")
@@ -462,10 +694,6 @@ class EnhancedWebArenaMAS:
         if 'algorithm_path' in checkpoint and hasattr(self.algorithm, 'load_checkpoint'):
             self.algorithm.load_checkpoint(checkpoint['algorithm_path'])
         
-        # Load orchestrator state
-        if 'orchestrator_state' in checkpoint and self.use_orchestrator:
-            self.orchestrator.load_state_dict(checkpoint['orchestrator_state'])
-        
         print(f"Checkpoint loaded from {filepath}")
 
 
@@ -478,30 +706,108 @@ def create_enhanced_mas_from_config(config_path: str) -> EnhancedWebArenaMAS:
     return EnhancedWebArenaMAS(**config)
 
 
-def run_single_task_test(method: str = 'p3o') -> Dict:
+def test_enhanced_metrics_integration():
+    """Test the enhanced metrics integration"""
+    print("Testing Enhanced WebArena MAS with Metrics Integration...")
+    
+    # Create MAS with LLM orchestrator
+    mas = EnhancedWebArenaMAS(
+        method='p3o',
+        budget=1.0,
+        use_llm_orchestrator=True,
+        llm_model='gpt-4-turbo',
+        enable_replanning=True,
+        num_agents=2
+    )
+    
+    # Test task
+    test_task = {
+        'intent': 'Test task with metrics',
+        'sites': ['example.com'],
+        'expected_steps': 3,
+        'observation': 'Test homepage'
+    }
+    
+    try:
+        result = mas.solve_task(test_task)
+        print(f"✅ Task completed - Success: {result['success']}, Cost: {result['cost']:.3f}")
+        
+        if 'enhanced_metrics' in result:
+            print("✅ Enhanced metrics captured successfully")
+            metrics = result['enhanced_metrics']
+            if 'task_summary' in metrics:
+                print(f"   - Task summary available")
+            if 'llm_orchestrator_metrics' in metrics:
+                print(f"   - LLM orchestrator metrics available")
+            if 'cost_analysis' in metrics:
+                print(f"   - Cost analysis available")
+        else:
+            print("⚠️  Enhanced metrics not available (WebArenaMetrics not imported)")
+        
+        # Test metrics summary
+        summary = mas.get_enhanced_metrics_summary()
+        print(f"✅ Enhanced metrics summary: {len(summary)} sections")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Test failed: {e}")
+        return False
+
+
+def run_single_task_test(method: str = 'p3o', use_llm: bool = False) -> Dict:
     """Run a single task test for debugging"""
     # Create test task
     test_task = {
         'task_id': 'test_001',
         'intent': 'Navigate to shopping page and add item to cart',
-        'sites': ['shopping.com']
+        'sites': ['shopping.com'],
+        'expected_steps': 3,
+        'observation': 'Current page shows shopping website homepage with search bar visible'
     }
     
     # Create MAS
-    mas = EnhancedWebArenaMAS(method=method, budget=0.5, num_agents=2)
+    mas = EnhancedWebArenaMAS(
+        method=method, 
+        budget=0.5, 
+        num_agents=2,
+        use_llm_orchestrator=use_llm,
+        llm_model="gpt-4-turbo" if use_llm else None
+    )
     
     # Solve task
     result = mas.solve_task(test_task)
     
-    print(f"Test Result - Method: {method}")
+    print(f"Test Result - Method: {method}, LLM: {use_llm}")
     print(f"Success: {result['success']}")
     print(f"Cost: {result['cost']:.3f} (Budget: {mas.budget})")
     print(f"Reward: {result['reward']:.3f}")
     print(f"DAG nodes: {result['dag_metrics'].get('nodes', 0)}")
+    print(f"Replanning count: {result.get('replanning_count', 0)}")
+    
+    # Enhanced metrics information
+    if 'enhanced_metrics' in result:
+        print("✅ Enhanced metrics collected successfully")
+    
+    if use_llm and 'dag' in result and isinstance(result['dag'], dict):
+        dag_info = result['dag'].get('dag', {})
+        print(f"LLM confidence: {dag_info.get('confidence', 'N/A')}")
+        print(f"LLM reasoning: {dag_info.get('reasoning', 'N/A')}")
     
     return result
 
 
 if __name__ == "__main__":
-    # Run test
-    result = run_single_task_test('p3o')
+    # Run tests
+    print("Enhanced WebArena MAS with Metrics Integration")
+    print("=" * 50)
+    
+    # Test basic functionality
+    print("=== Testing Regular Orchestrator ===")
+    result1 = run_single_task_test('p3o', use_llm=False)
+    
+    print("\n=== Testing LLM Orchestrator ===")
+    result2 = run_single_task_test('p3o', use_llm=True)
+    
+    print("\n=== Testing Enhanced Metrics Integration ===")
+    test_enhanced_metrics_integration()

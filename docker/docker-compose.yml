@@ -1,0 +1,119 @@
+# docker/docker-compose.yml
+version: '3.8'
+
+services:
+  mas-trainer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ${DOCKER_REGISTRY:-local}/webarena-mas:${VERSION:-latest}
+    container_name: mas-trainer
+    hostname: mas-trainer
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - WANDB_API_KEY=${WANDB_API_KEY}
+      - WANDB_PROJECT=webarena-mas
+      - CUDA_LAUNCH_BLOCKING=1
+      - TRAINING_MODE=distributed
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ../data:/workspace/data
+      - ../models:/workspace/models
+      - ../logs:/workspace/logs
+      - ../results:/workspace/results
+      - ../checkpoints:/workspace/checkpoints
+      - model-cache:/root/.cache
+      - dag-cache:/workspace/dag_cache
+    ports:
+      - "6006:6006"  # TensorBoard
+      - "8888:8888"  # Jupyter
+    networks:
+      - mas-network
+    shm_size: '32gb'
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["train", "--method", "${METHOD:-p3o}", "--distributed"]
+    depends_on:
+      - redis
+
+  mas-api:
+    image: ${DOCKER_REGISTRY:-local}/webarena-mas:${VERSION:-latest}
+    container_name: mas-api
+    hostname: mas-api
+    runtime: nvidia
+    environment:
+      - MODEL_PATH=/workspace/models/best_checkpoint.pt
+      - REDIS_URL=redis://redis:6379
+      - API_WORKERS=4
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ../models:/workspace/models:ro
+      - ../logs:/workspace/logs
+      - dag-cache:/workspace/dag_cache
+    ports:
+      - "8000:8000"  # API
+    networks:
+      - mas-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: ["serve", "--port", "8000", "--workers", "4"]
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: mas-redis
+    hostname: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - mas-network
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+  monitoring:
+    image: grafana/grafana:latest
+    container_name: mas-monitoring
+    hostname: monitoring
+    ports:
+      - "3000:3000"
+    networks:
+      - mas-network
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ../deployment/grafana:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=redis-datasource
+    restart: unless-stopped
+
+networks:
+  mas-network:
+    driver: bridge
+
+volumes:
+  model-cache:
+  dag-cache:
+  redis-data:
+  grafana-data:

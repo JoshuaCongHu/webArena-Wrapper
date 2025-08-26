@@ -1,5 +1,8 @@
+from utils.observation_processor import ObservationProcessor
+from utils.mas_response import MASResponse
+from utils.budget_tracker import BudgetTracker
+
 class WebArenaMAS:
-    """MAS system adapted for WebArena tasks"""
     
     def __init__(self, agents, orchestrator):
         self.agents = agents

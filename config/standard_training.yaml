@@ -1,0 +1,31 @@
+# config/standard_training.yaml
+# Standard training configuration
+method: p3o
+budget: 1.0
+num_agents: 4
+llm_model: gpt-4-turbo
+use_llm_orchestrator: true
+enable_replanning: true
+
+# Training parameters
+episodes: 10000
+batch_size: 32
+learning_rate: 3e-4
+gamma: 0.99
+ppo_epochs: 4
+
+# Infrastructure
+gpu_type: "NVIDIA RTX A6000"
+gpu_count: 2
+distributed: true
+
+# Data
+data_path: /workspace/data
+eval_interval: 100
+save_interval: 500
+
+# Logging
+use_wandb: true
+wandb_project: webarena-mas
+run_name: standard-training
+stream_logs: true

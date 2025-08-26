@@ -1,24 +1,26 @@
 # webarena_wrapper.py
 import time
 from typing import Dict, List, Any
+# Fix WebArena imports - use actual WebArena structure
 from browser_env import ScriptBrowserEnv
-from evaluation_harness.evaluators import Evaluator
+from evaluation_harness.evaluators import evaluator_router
+
+# Import your monitors
+from monitors.communication_monitor import CommunicationMonitor
+from monitors.action_monitor import ActionMonitor
 from webArenaCostMonitor import WebArenaCostMonitor
-from CommunicationMonitor import CommunicationMonitor
-from ActionMonitor import ActionMonitor
 
 class WebArenaWrapper:
     """Wrapper for WebArena that adds cost and communication monitoring"""
     
     def __init__(self, env_config=None):
-        # Initialize WebArena components
+        # Use actual WebArena environment
         self.env = ScriptBrowserEnv(
             headless=True,
-            observation_type="accessibility_tree", 
+            observation_type="accessibility_tree",
             current_viewport_only=True,
             viewport_size={"width": 1280, "height": 720}
         )
-        self.evaluator = Evaluator()
         
         # Initialize monitoring
         self.cost_monitor = WebArenaCostMonitor()
@@ -110,50 +112,4 @@ class WebArenaWrapper:
             'trajectory': trajectory,
             'communication_stats': self.comm_monitor.get_stats(),
             'cost_breakdown': self.cost_monitor.get_breakdown()
-        }
-    
-    def reset_monitors(self):
-        """Reset all monitors for new task"""
-        self.comm_monitor.reset()
-        self.action_monitor.reset()
-        
-    def parse_mas_response(self, mas_response):
-        """Extract action from MAS response"""
-        if hasattr(mas_response, 'action'):
-            return mas_response.action
-        elif isinstance(mas_response, dict):
-            return mas_response.get('action', {})
-        else:
-            return {'type': 'wait', 'text': str(mas_response)}
-            
-    def calculate_step_cost(self, mas_response):
-        """Calculate cost of this step"""
-        # Base cost per step
-        cost = 0.001
-        
-        # Add LLM costs if available
-        if hasattr(mas_response, 'tokens_used'):
-            cost += mas_response.tokens_used * 0.00003  # Rough GPT-4 pricing
-            
-        # Add vision costs if screenshot was analyzed
-        if hasattr(mas_response, 'used_vision'):
-            cost += 0.01 if mas_response.used_vision else 0
-            
-        return cost
-        
-    def aggregate_results(self, results):
-        """Aggregate results across all tasks"""
-        if not results:
-            return {'success_rate': 0, 'avg_cost': 0, 'avg_steps': 0}
-            
-        total_tasks = len(results)
-        successes = sum(1 for r in results if r['success'])
-        total_cost = sum(r['total_cost'] for r in results)
-        total_steps = sum(r['steps'] for r in results)
-        
-        return {
-            'success_rate': successes / total_tasks,
-            'avg_cost': total_cost / total_tasks,
-            'avg_steps': total_steps / total_tasks,
-            'results': results
         }

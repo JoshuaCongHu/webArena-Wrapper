@@ -1,0 +1,30 @@
+# config/test_training.yaml
+# Quick test configuration
+method: p3o
+budget: 1.0
+num_agents: 2
+llm_model: gpt-4-turbo
+use_llm_orchestrator: true
+enable_replanning: true
+
+# Training parameters
+episodes: 100
+batch_size: 8
+learning_rate: 3e-4
+gamma: 0.99
+ppo_epochs: 4
+
+# Infrastructure
+gpu_type: "NVIDIA RTX 3090"
+gpu_count: 1
+distributed: false
+
+# Data
+data_path: /workspace/data
+eval_interval: 20
+save_interval: 50
+
+# Logging
+use_wandb: true
+wandb_project: webarena-mas-test
+run_name: test-run

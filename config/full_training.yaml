@@ -1,0 +1,44 @@
+# config/full_training.yaml
+# Full research training configuration
+method: p3o
+budget: 1.0
+num_agents: 4
+max_nodes: 10
+llm_model: gpt-4-turbo
+use_llm_orchestrator: true
+enable_replanning: true
+
+# Training parameters
+episodes: 50000
+batch_size: 128
+learning_rate: 3e-4
+gamma: 0.99
+ppo_epochs: 4
+
+# Method-specific parameters
+penalty_coef: 10.0  # For P3O
+alpha: 1.05
+beta: 0.95
+
+# Infrastructure
+gpu_type: "NVIDIA RTX A6000"
+gpu_count: 4
+distributed: true
+memory_gb: 64
+
+# Data
+data_path: /workspace/persistent/data
+eval_interval: 100
+save_interval: 1000
+num_workers: 8
+
+# Checkpointing
+checkpoint_dir: /workspace/persistent/checkpoints
+keep_checkpoints: 10
+
+# Logging
+use_wandb: true
+wandb_project: webarena-mas-research
+run_name: full-training
+log_dir: /workspace/persistent/logs
+stream_logs: true
